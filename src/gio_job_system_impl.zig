@@ -122,7 +122,7 @@ pub const GioJobBuffer = struct {
     }
 };
 
-const GioWorkerError = enum {} || GioJobBufferError;
+const GioWorkerError = error{} || GioJobBufferError;
 
 pub const GioWorker = struct {
     const Self = @This();
@@ -146,7 +146,7 @@ pub const GioWorker = struct {
 
 threadlocal var tls_worker: ?*GioWorker = null;
 
-const GioJobQueueError = enum {
+const GioJobQueueError = error{
     GioJobQueueFull,
     GioJobQueueRaceLost,
 };
@@ -154,21 +154,20 @@ const GioJobQueueError = enum {
 pub const GioJobQueue = struct {
     const Self = @This();
 
-    head: usize,
-    data: []*GioJob,
+    head: usize = 0,
+    jobs: []*GioJob = undefined,
 
     pub fn init(arena: *gio_arena.GioArena, capacity: usize) Self {
         //TODO: check if capacity is power of two
-        const self = Self{};
-        self.data = try arena.pushArray(GioJob, capacity, .{ .zero = true }) catch unreachable;
-        @atomicStore(usize, &self.head, -1, .monotonic);
+        var self = Self{};
+        self.jobs = arena.pushArray(*GioJob, capacity, .{ .zero = true }) catch unreachable;
         return self;
     }
 
     pub fn push(self: *Self, job: *GioJob) GioJobQueueError!void {
         const head = @atomicLoad(usize, &self.head, .acquire);
-        if (head == self.data.len - 1) {
-            return .GioJobQueueFull;
+        if (head == self.jobs.len) {
+            return GioJobQueueError.GioJobQueueFull;
         }
         if (@cmpxchgStrong(
             usize,
@@ -178,14 +177,15 @@ pub const GioJobQueue = struct {
             .acq_rel,
             .monotonic,
         ) == null) {
-            self.data[head + 1] = job;
+            self.jobs[head] = job;
+            return;
         }
-        return .GioJobQueueRaceLost;
+        return GioJobQueueError.GioJobQueueRaceLost;
     }
 
-    pub fn pop(self: *Self) *GioJob {
+    pub fn pop(self: *Self) ?*GioJob {
         const head = @atomicLoad(usize, &self.head, .acquire);
-        if (head == -1) {
+        if (head == 0) {
             return null;
         }
         if (@cmpxchgStrong(
@@ -196,7 +196,7 @@ pub const GioJobQueue = struct {
             .acq_rel,
             .monotonic,
         ) == null) {
-            return self.jobs[head];
+            return self.jobs[head - 1];
         }
         return null;
     }
@@ -264,6 +264,94 @@ pub fn workerMain(arena: *gio_arena.GioArena, sys: *GioJobSystem, worker: *GioWo
 }
 
 const testing = @import("std").testing;
+
+test "JobQueueInit" {
+    const arena: *gio_arena.GioArena = try .init(.{});
+    defer arena.deinit();
+
+    var queue: GioJobQueue = .init(arena, 16);
+
+    try testing.expectEqual(queue.jobs.len, 16);
+    try testing.expectEqual(queue.head, 0);
+}
+
+test "JobQueuePushValues" {
+    const arena: *gio_arena.GioArena = try .init(.{});
+    defer arena.deinit();
+
+    var queue: GioJobQueue = .init(arena, 16);
+
+    try testing.expectEqual(queue.jobs.len, 16);
+    try testing.expectEqual(queue.head, 0);
+
+    const arr = try arena.pushArray(usize, 16, .{});
+    const jobs = try arena.pushArray(GioJob, 16, .{});
+    var index: usize = 0;
+    while (index < 16) : (index += 1) {
+        arr[index] = index;
+        jobs[index].ctx = &arr[index];
+        try queue.push(&jobs[index]);
+    }
+
+    try testing.expectEqual(queue.head, 16);
+    for (jobs, 0..) |job, i| {
+        const value: *usize = @ptrCast(@alignCast(job.ctx));
+        try testing.expectEqual(value.*, arr[i]);
+    }
+}
+
+test "JobQueuePopValues" {
+    const arena: *gio_arena.GioArena = try .init(.{});
+    defer arena.deinit();
+
+    var queue: GioJobQueue = .init(arena, 16);
+
+    try testing.expectEqual(queue.jobs.len, 16);
+    try testing.expectEqual(queue.head, 0);
+
+    const arr = try arena.pushArray(usize, 16, .{});
+    const jobs = try arena.pushArray(GioJob, 16, .{});
+    var index: usize = 0;
+    while (index < 16) : (index += 1) {
+        arr[index] = index;
+        jobs[index].ctx = &arr[index];
+        try queue.push(&jobs[index]);
+    }
+
+    while (queue.pop()) |job| {
+        const value: *usize = @ptrCast(@alignCast(job.ctx));
+        index -= 1;
+        try testing.expectEqual(queue.head, index);
+        try testing.expectEqual(value.*, arr[index]);
+    }
+}
+
+test "JobQueuePushOverflow" {
+    const arena: *gio_arena.GioArena = try .init(.{});
+    defer arena.deinit();
+
+    var queue: GioJobQueue = .init(arena, 8);
+
+    const jobs = try arena.pushArray(GioJob, 16, .{});
+    var index: usize = 0;
+    while (index < 8) : (index += 1) {
+        try queue.push(&jobs[index]);
+    }
+
+    const result = queue.push(&jobs[index]);
+    try testing.expectError(GioJobQueueError.GioJobQueueFull, result);
+}
+
+test "JobQueueEmpty" {
+    const arena: *gio_arena.GioArena = try .init(.{});
+    defer arena.deinit();
+
+    var queue: GioJobQueue = .init(arena, 8);
+
+    const result = queue.pop();
+    try testing.expectEqual(queue.head, 0);
+    try testing.expectEqual(result, null);
+}
 
 test "JobBufferInit" {
     const arena: *gio_arena.GioArena = try .init(.{});
