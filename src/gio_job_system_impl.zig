@@ -18,8 +18,8 @@ pub const GioJobBuffer = struct {
     const Self = @This();
 
     jobs: []*GioJob = undefined,
-    head: usize = 0,
-    tail: usize = 0,
+    head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     pub fn init(arena: *gio_arena.GioArena, capacity: usize) Self {
         //TODO: check if its power of two here
@@ -36,8 +36,10 @@ pub const GioJobBuffer = struct {
     pub fn push(self: *Self, job: *GioJob) GioJobBufferError!void {
         const end = self.jobs.len;
         const start = 0;
-        const head = @atomicLoad(usize, &self.head, .acquire);
-        const tail = @atomicLoad(usize, &self.tail, .monotonic);
+        // const head = @atomicLoad(usize, &self.head, .acquire);
+        // const tail = @atomicLoad(usize, &self.tail, .monotonic);
+        const head = self.head.load(.acquire);
+        const tail = self.tail.load(.monotonic);
 
         var next_head = head + 1;
 
@@ -46,12 +48,10 @@ pub const GioJobBuffer = struct {
         }
 
         if (next_head == tail) {
-            return GioJobBufferError.JobBufferFull;
+            return error.JobBufferFull;
         }
 
-        if (@cmpxchgStrong(
-            usize,
-            &self.head,
+        if (self.head.cmpxchgStrong(
             head,
             next_head,
             .acq_rel,
@@ -60,12 +60,12 @@ pub const GioJobBuffer = struct {
             self.jobs[head] = job;
             return;
         }
-        return GioJobBufferError.JobBufferStealRaceLost;
+        return error.JobBufferStealRaceLost;
     }
 
     pub fn pop(self: *Self) ?*GioJob {
-        const head = @atomicLoad(usize, &self.head, .acquire);
-        const tail = @atomicLoad(usize, &self.tail, .monotonic);
+        const head = self.head.load(.acquire); // @atomicLoad(usize, &self.head, .acquire);
+        const tail = self.tail.load(.monotonic); // @atomicLoad(usize, &self.tail, .monotonic);
         const end = self.jobs.len;
         const start = -1;
 
@@ -77,9 +77,7 @@ pub const GioJobBuffer = struct {
         var tail_next = tail + 1;
         if (tail_next == end) {
             tail_next = 0;
-            if (@cmpxchgStrong(
-                usize,
-                &self.tail,
+            if (self.tail.cmpxchgStrong(
                 tail,
                 tail_next,
                 .acq_rel,
@@ -89,13 +87,13 @@ pub const GioJobBuffer = struct {
             }
             return null;
         }
-        @atomicStore(usize, &self.head, prev, .release);
+        self.head.store(prev, .release); // @atomicStore(usize, &self.head, prev, .release);
         return self.jobs[prev];
     }
 
     pub fn steal(self: *Self) ?*GioJob {
-        const head = @atomicLoad(usize, &self.head, .acquire);
-        const tail = @atomicLoad(usize, &self.tail, .acquire);
+        const head = self.head.load(.acquire); // @atomicLoad(usize, &self.head, .acquire);
+        const tail = self.tail.load(.monotonic); // @atomicLoad(usize, &self.tail, .acquire);
         const end = self.jobs.len;
 
         if (tail == head) {
@@ -108,9 +106,7 @@ pub const GioJobBuffer = struct {
             next = 0;
         }
 
-        if (@cmpxchgStrong(
-            usize,
-            &self.tail,
+        if (self.tail.cmpxchgStrong(
             tail,
             next,
             .acq_rel,
@@ -154,7 +150,7 @@ const GioJobQueueError = error{
 pub const GioJobQueue = struct {
     const Self = @This();
 
-    head: usize = 0,
+    head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     jobs: []*GioJob = undefined,
 
     pub fn init(arena: *gio_arena.GioArena, capacity: usize) Self {
@@ -165,13 +161,11 @@ pub const GioJobQueue = struct {
     }
 
     pub fn push(self: *Self, job: *GioJob) GioJobQueueError!void {
-        const head = @atomicLoad(usize, &self.head, .acquire);
+        const head = self.head.load(.acquire); // @atomicLoad(usize, &self.head, .acquire);
         if (head == self.jobs.len) {
-            return GioJobQueueError.GioJobQueueFull;
+            return error.GioJobQueueFull;
         }
-        if (@cmpxchgStrong(
-            usize,
-            &self.head,
+        if (self.head.cmpxchgStrong(
             head,
             head + 1,
             .acq_rel,
@@ -180,17 +174,15 @@ pub const GioJobQueue = struct {
             self.jobs[head] = job;
             return;
         }
-        return GioJobQueueError.GioJobQueueRaceLost;
+        return error.GioJobQueueRaceLost;
     }
 
     pub fn pop(self: *Self) ?*GioJob {
-        const head = @atomicLoad(usize, &self.head, .acquire);
+        const head = self.head.load(.acquire); // @atomicLoad(usize, &self.head, .acquire);
         if (head == 0) {
             return null;
         }
-        if (@cmpxchgStrong(
-            usize,
-            &self.head,
+        if (self.head.cmpxchgStrong(
             head,
             head - 1,
             .acq_rel,
@@ -208,7 +200,7 @@ pub const GioJobSystem = struct {
     const Self = @This();
 
     global_queue: GioJobQueue,
-    running: bool,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     workers: []*GioWorker,
 
     pub fn init(arena: *gio_arena.GioArena, worker_count: usize, worker_buffer_capacity: usize, global_queue_capacity: usize) Self {
@@ -272,7 +264,7 @@ test "JobQueueInit" {
     var queue: GioJobQueue = .init(arena, 16);
 
     try testing.expectEqual(queue.jobs.len, 16);
-    try testing.expectEqual(queue.head, 0);
+    try testing.expectEqual(queue.head.raw, 0);
 }
 
 test "JobQueuePushValues" {
@@ -282,7 +274,7 @@ test "JobQueuePushValues" {
     var queue: GioJobQueue = .init(arena, 16);
 
     try testing.expectEqual(queue.jobs.len, 16);
-    try testing.expectEqual(queue.head, 0);
+    try testing.expectEqual(queue.head.raw, 0);
 
     const arr = try arena.pushArray(usize, 16, .{});
     const jobs = try arena.pushArray(GioJob, 16, .{});
@@ -293,7 +285,7 @@ test "JobQueuePushValues" {
         try queue.push(&jobs[index]);
     }
 
-    try testing.expectEqual(queue.head, 16);
+    try testing.expectEqual(queue.head.raw, 16);
     for (jobs, 0..) |job, i| {
         const value: *usize = @ptrCast(@alignCast(job.ctx));
         try testing.expectEqual(value.*, arr[i]);
@@ -307,7 +299,7 @@ test "JobQueuePopValues" {
     var queue: GioJobQueue = .init(arena, 16);
 
     try testing.expectEqual(queue.jobs.len, 16);
-    try testing.expectEqual(queue.head, 0);
+    try testing.expectEqual(queue.head.raw, 0);
 
     const arr = try arena.pushArray(usize, 16, .{});
     const jobs = try arena.pushArray(GioJob, 16, .{});
@@ -321,7 +313,7 @@ test "JobQueuePopValues" {
     while (queue.pop()) |job| {
         const value: *usize = @ptrCast(@alignCast(job.ctx));
         index -= 1;
-        try testing.expectEqual(queue.head, index);
+        try testing.expectEqual(queue.head.raw, index);
         try testing.expectEqual(value.*, arr[index]);
     }
 }
@@ -349,7 +341,7 @@ test "JobQueueEmpty" {
     var queue: GioJobQueue = .init(arena, 8);
 
     const result = queue.pop();
-    try testing.expectEqual(queue.head, 0);
+    try testing.expectEqual(queue.head.raw, 0);
     try testing.expectEqual(result, null);
 }
 
@@ -360,8 +352,8 @@ test "JobBufferInit" {
     const buffer: GioJobBuffer = .init(arena, 16);
 
     try testing.expectEqual(buffer.jobs.len, 16);
-    try testing.expectEqual(buffer.head, 0);
-    try testing.expectEqual(buffer.tail, 0);
+    try testing.expectEqual(buffer.head.raw, 0);
+    try testing.expectEqual(buffer.tail.raw, 0);
 }
 
 fn dummy(user: *anyopaque) void {
@@ -384,8 +376,8 @@ test "JobBufferPush" {
     try buffer.push(job);
 
     try testing.expect(buffer.jobs.len > -1);
-    try testing.expect(buffer.head > 0);
-    try testing.expectEqual(buffer.tail, 0);
+    try testing.expect(buffer.head.raw > 0);
+    try testing.expectEqual(buffer.tail.raw, 0);
     const addedJob = buffer.jobs[0];
 
     try testing.expectEqual(addedJob.func, dummy);
